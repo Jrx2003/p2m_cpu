@@ -9,6 +9,9 @@
 #include <atomic>
 #include <thread>
 #include <mutex>
+#include <limits>
+#include <unordered_map>
+#include <unordered_set>
 
 // Orbbec SDK
 #include "libobsensor/ObSensor.hpp"
@@ -32,6 +35,12 @@
 extern float g_edgeFactor;
 extern int   g_pixStride;
 extern float g_dzMax;
+extern float g_holePerimeter;
+
+// Forward declaration for mesh hole patching helper
+void patchSmallMeshHoles(pcl::PointCloud<pcl::PointXYZRGB>::Ptr& cloud,
+                         std::vector<pcl::Vertices>& tris,
+                         float maxPerimeter);
 
 //==================== Real-time Mesh Reconstruction Class ====================
 
@@ -607,6 +616,9 @@ public:
             max_kept = std::max({max_kept, L(i0,i1), L(i1,i2), L(i2,i0)});
         }
 
+        // Patch small mesh holes (perimeter threshold in meters)
+        patchSmallMeshHoles(used, tris, g_holePerimeter);
+
         // Publish mesh + cloud_for_mesh atomically (keep them in sync)
         {
             std::lock_guard<std::recursive_mutex> lock(cloudMutex);
@@ -661,6 +673,209 @@ public:
     int getHeight() const { return height; }
 };
 
+//==================== Mesh hole patching (small holes only) ====================
+
+struct EdgeKey {
+    uint32_t a{0}, b{0};
+    EdgeKey() = default;
+    EdgeKey(uint32_t i, uint32_t j) {
+        if(i < j) { a = i; b = j; }
+        else      { a = j; b = i; }
+    }
+    bool operator==(const EdgeKey& other) const noexcept {
+        return a == other.a && b == other.b;
+    }
+};
+
+struct EdgeKeyHash {
+    std::size_t operator()(const EdgeKey& k) const noexcept {
+        return (static_cast<std::size_t>(k.a) << 32) ^ static_cast<std::size_t>(k.b);
+    }
+};
+
+void patchSmallMeshHoles(pcl::PointCloud<pcl::PointXYZRGB>::Ptr& cloud,
+                         std::vector<pcl::Vertices>& tris,
+                         float maxPerimeter)
+{
+    if(!cloud || tris.empty()) return;
+    auto &pts = cloud->points;
+
+    struct EdgeInfo {
+        uint32_t a{0}, b{0};
+        int count{0};
+    };
+
+    std::unordered_map<EdgeKey, EdgeInfo, EdgeKeyHash> edgeMap;
+    edgeMap.reserve(tris.size() * 3);
+
+    auto addEdge = [&](uint32_t i0, uint32_t i1) {
+        EdgeKey key(i0, i1);
+        auto it = edgeMap.find(key);
+        if(it == edgeMap.end()) {
+            edgeMap.emplace(key, EdgeInfo{key.a, key.b, 1});
+        } else {
+            it->second.count++;
+        }
+    };
+
+    for(const auto& tri : tris) {
+        if(tri.vertices.size() != 3) continue;
+        uint32_t i0 = tri.vertices[0];
+        uint32_t i1 = tri.vertices[1];
+        uint32_t i2 = tri.vertices[2];
+        addEdge(i0, i1);
+        addEdge(i1, i2);
+        addEdge(i2, i0);
+    }
+
+    std::vector<std::pair<uint32_t, uint32_t>> boundaryEdges;
+    boundaryEdges.reserve(edgeMap.size());
+    for(const auto& kv : edgeMap) {
+        const EdgeInfo& info = kv.second;
+        if(info.count == 1) {
+            boundaryEdges.emplace_back(info.a, info.b);
+        }
+    }
+
+    if(boundaryEdges.empty()) return;
+
+    std::unordered_map<uint32_t, std::vector<uint32_t>> adj;
+    adj.reserve(boundaryEdges.size() * 2);
+    for(const auto& e : boundaryEdges) {
+        adj[e.first].push_back(e.second);
+        adj[e.second].push_back(e.first);
+    }
+
+    auto edgeKeyUint64 = [](uint32_t i, uint32_t j) -> uint64_t {
+        if(i > j) std::swap(i, j);
+        return (static_cast<uint64_t>(i) << 32) | static_cast<uint64_t>(j);
+    };
+
+    std::unordered_set<uint64_t> usedEdges;
+    usedEdges.reserve(boundaryEdges.size() * 2);
+
+    size_t patchedLoops = 0;
+
+    for(const auto& e : boundaryEdges) {
+        uint32_t a = e.first;
+        uint32_t b = e.second;
+        uint64_t key = edgeKeyUint64(a, b);
+        if(usedEdges.count(key)) continue;
+
+        std::vector<uint32_t> loop;
+        loop.reserve(32);
+        loop.push_back(a);
+        loop.push_back(b);
+        usedEdges.insert(key);
+
+        uint32_t prev = a;
+        uint32_t curr = b;
+        bool closed = false;
+
+        while(true) {
+            auto itAdj = adj.find(curr);
+            if(itAdj == adj.end()) break;
+
+            uint32_t next = std::numeric_limits<uint32_t>::max();
+            for(uint32_t candidate : itAdj->second) {
+                if(candidate == prev) continue;
+                uint64_t key2 = edgeKeyUint64(curr, candidate);
+                if(!usedEdges.count(key2)) {
+                    next = candidate;
+                    usedEdges.insert(key2);
+                    break;
+                }
+            }
+
+            if(next == std::numeric_limits<uint32_t>::max()) break;
+
+            if(next == loop.front()) {
+                closed = true;
+                break;
+            }
+
+            loop.push_back(next);
+            prev = curr;
+            curr = next;
+
+            if(loop.size() > 512) {
+                closed = false;
+                break;
+            }
+        }
+
+        if(!closed || loop.size() < 3) continue;
+
+        float perimeter = 0.0f;
+        bool perimeterInvalid = false;
+        for(size_t i = 0; i < loop.size(); ++i) {
+            uint32_t i0 = loop[i];
+            uint32_t i1 = loop[(i + 1) % loop.size()];
+            const auto& p0 = pts[i0];
+            const auto& p1 = pts[i1];
+            if(!pcl::isFinite(p0) || !pcl::isFinite(p1)) {
+                perimeterInvalid = true;
+                break;
+            }
+            float dx = p0.x - p1.x;
+            float dy = p0.y - p1.y;
+            float dz = p0.z - p1.z;
+            perimeter += std::sqrt(dx*dx + dy*dy + dz*dz);
+        }
+        if(perimeterInvalid || perimeter > maxPerimeter) continue;
+
+        pcl::PointXYZRGB center;
+        center.x = center.y = center.z = 0.0f;
+        int cntValid = 0;
+        int sumR = 0, sumG = 0, sumB = 0;
+        for(uint32_t vid : loop) {
+            const auto& p = pts[vid];
+            if(!pcl::isFinite(p)) continue;
+            center.x += p.x;
+            center.y += p.y;
+            center.z += p.z;
+            sumR += p.r;
+            sumG += p.g;
+            sumB += p.b;
+            cntValid++;
+        }
+        if(cntValid < 3) continue;
+
+        center.x /= cntValid;
+        center.y /= cntValid;
+        center.z /= cntValid;
+        center.r = static_cast<uint8_t>(sumR / cntValid);
+        center.g = static_cast<uint8_t>(sumG / cntValid);
+        center.b = static_cast<uint8_t>(sumB / cntValid);
+
+        uint32_t centerIdx = static_cast<uint32_t>(pts.size());
+        pts.push_back(center);
+        cloud->width = static_cast<uint32_t>(pts.size());
+        cloud->height = 1;
+        cloud->is_dense = false;
+
+        for(size_t i = 0; i < loop.size(); ++i) {
+            uint32_t v0 = loop[i];
+            uint32_t v1 = loop[(i + 1) % loop.size()];
+            if(v0 == v1 || v0 == centerIdx || v1 == centerIdx) continue;
+            pcl::Vertices tri;
+            tri.vertices.resize(3);
+            tri.vertices[0] = centerIdx;
+            tri.vertices[1] = v0;
+            tri.vertices[2] = v1;
+            tris.push_back(std::move(tri));
+        }
+
+        patchedLoops++;
+    }
+
+    if(patchedLoops > 0) {
+        std::cout << "[MeshHole] patched loops=" << patchedLoops
+                  << " newPoints=" << pts.size()
+                  << " trisAfter=" << tris.size() << std::endl;
+    }
+}
+
 //==================== OpenGL Viewer with VBO ====================
 
 // Mesh display modes
@@ -696,11 +911,14 @@ GLsizei g_pointCount = 0;
 GLsizei g_meshIndexCount = 0;
 
 // Mesh edge length factor (controls max triangle edge length = spacing * factor)
-float g_edgeFactor = 30.0f;
+float g_edgeFactor = 40.0f;
 
 // Grid triangulation controls
 int   g_pixStride = 4;      // pixel stride for manual grid triangulation
 float g_dzMax     = 0.08f;  // allowed depth jump between adjacent vertices (meters)
+
+// Mesh hole patching threshold (perimeter in meters)
+float g_holePerimeter = 0.6f;
 
 // Performance tracking
 int g_frameCount = 0;
@@ -1080,6 +1298,16 @@ void keyboardFunc(unsigned char key, int, int) {
         case '=':
             g_pixStride = std::min(16, g_pixStride + 1);
             std::cout << "pixStride=" << g_pixStride << std::endl;
+            break;
+        case '.':
+        case '>':
+            g_holePerimeter = std::min(5.0f, g_holePerimeter + 0.1f);
+            std::cout << "holePerimeter=" << g_holePerimeter << " m" << std::endl;
+            break;
+        case ',':
+        case '<':
+            g_holePerimeter = std::max(0.1f, g_holePerimeter - 0.1f);
+            std::cout << "holePerimeter=" << g_holePerimeter << " m" << std::endl;
             break;
         case 'w':
         case 'W':

@@ -1,0 +1,50 @@
+# Build directories
+build/
+bin/
+lib/
+include/
+
+# Portable package
+P2M_Portable/
+
+# CMake artifacts
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt
+*.vcxproj
+*.vcxproj.filters
+*.sln
+*.tlog
+*.recipe
+*.lastbuildstate
+*.log
+
+# Binaries
+*.exe
+*.dll
+*.lib
+*.pdb
+*.obj
+*.ilk
+
+# Archives
+*.zip
+*.7z
+*.tar
+*.gz
+
+# Logs
+*.log.txt
+Log/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vs/
+.vscode/
+*.user
+*.opendb
+
+
+

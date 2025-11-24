@@ -887,11 +887,20 @@ enum MeshDisplayMode {
 
 RealtimeMeshReconstruction* g_app = nullptr;
 
+constexpr float kDefaultAngleX   = 20.0f;
+constexpr float kDefaultAngleY   = -30.0f;
+constexpr float kDefaultCenterX  = 0.0f;
+constexpr float kDefaultCenterY  = 0.0f;
+constexpr float kDefaultCenterZ  = 0.5f;
+constexpr float kDefaultDistance = 2.5f;
+
 int   g_winW = 1280;
 int   g_winH = 720;
-float g_angleX = 20.0f;    // Original initial view angle
-float g_angleY = -30.0f;   // Original initial view angle
-float g_distance = 2.5f;  // Original distance
+float g_angleX = kDefaultAngleX;    // Pitch
+float g_angleY = kDefaultAngleY;    // Yaw
+float g_roll   = 0.0f;              // Roll
+float g_camX = 0.0f, g_camY = 0.5f, g_camZ = -2.5f;  // Drone camera position
+float g_moveSpeed = 0.05f;                           // Movement speed (m per keypress)
 int   g_lastX = 0;
 int   g_lastY = 0;
 bool  g_leftDown = false;
@@ -900,7 +909,6 @@ MeshDisplayMode g_meshMode = MESH_FILL;  // Start with filled mesh
 bool  g_autoRotate = false;
 bool  g_paused = false;
 
-float g_centerX = 0.0f, g_centerY = 0.0f, g_centerZ = 0.5f;  // Original center
 float g_sceneScale = 1.0f;
 
 // VBO / EBO handles
@@ -1122,6 +1130,90 @@ void idleFunc() {
     glutPostRedisplay();
 }
 
+void resetCameraPose() {
+    g_angleX = kDefaultAngleX;
+    g_angleY = kDefaultAngleY;
+    g_roll   = 0.0f;
+
+    const float deg2rad = 3.14159265f / 180.0f;
+    float yaw   = g_angleY * deg2rad;
+    float pitch = g_angleX * deg2rad;
+    float cosPitch = std::cos(pitch);
+    float sinPitch = std::sin(pitch);
+    float cosYaw   = std::cos(yaw);
+    float sinYaw   = std::sin(yaw);
+
+    float dirX = cosPitch * sinYaw;
+    float dirY = sinPitch;
+    float dirZ = cosPitch * cosYaw;
+
+    g_camX = kDefaultCenterX - dirX * kDefaultDistance;
+    g_camY = kDefaultCenterY - dirY * kDefaultDistance;
+    g_camZ = kDefaultCenterZ - dirZ * kDefaultDistance;
+}
+
+void getCameraBasis(
+    float &dirX,  float &dirY,  float &dirZ,
+    float &upX,   float &upY,   float &upZ,
+    float &rightX,float &rightY,float &rightZ)
+{
+    const float deg2rad = 3.14159265f / 180.0f;
+    float yaw   = g_angleY * deg2rad;
+    float pitch = g_angleX * deg2rad;
+    float roll  = g_roll   * deg2rad;
+
+    float cosPitch = std::cos(pitch);
+    float sinPitch = std::sin(pitch);
+    float cosYaw   = std::cos(yaw);
+    float sinYaw   = std::sin(yaw);
+
+    dirX = cosPitch * sinYaw;
+    dirY = sinPitch;
+    dirZ = cosPitch * cosYaw;
+
+    float worldUpX = 0.0f, worldUpY = 1.0f, worldUpZ = 0.0f;
+    float dotUp = dirX * worldUpX + dirY * worldUpY + dirZ * worldUpZ;
+    if(std::fabs(dotUp) > 0.95f) {
+        worldUpX = 0.0f;
+        worldUpY = 0.0f;
+        worldUpZ = 1.0f;
+    }
+
+    rightX = dirY * worldUpZ - dirZ * worldUpY;
+    rightY = dirZ * worldUpX - dirX * worldUpZ;
+    rightZ = dirX * worldUpY - dirY * worldUpX;
+    float rightLen = std::sqrt(rightX*rightX + rightY*rightY + rightZ*rightZ);
+    if(rightLen > 1e-6f) {
+        rightX /= rightLen;
+        rightY /= rightLen;
+        rightZ /= rightLen;
+    }
+
+    upX = rightY * dirZ - rightZ * dirY;
+    upY = rightZ * dirX - rightX * dirZ;
+    upZ = rightX * dirY - rightY * dirX;
+    float upLen = std::sqrt(upX*upX + upY*upY + upZ*upZ);
+    if(upLen > 1e-6f) {
+        upX /= upLen;
+        upY /= upLen;
+        upZ /= upLen;
+    }
+
+    float cu = std::cos(roll);
+    float su = std::sin(roll);
+
+    float upX2    = upX    * cu + rightX * su;
+    float upY2    = upY    * cu + rightY * su;
+    float upZ2    = upZ    * cu + rightZ * su;
+
+    float rightX2 = rightX * cu - upX    * su;
+    float rightY2 = rightY * cu - upY    * su;
+    float rightZ2 = rightZ * cu - upZ    * su;
+
+    upX = upX2;    upY = upY2;    upZ = upZ2;
+    rightX = rightX2; rightY = rightY2; rightZ = rightZ2;
+}
+
 void displayFunc() {
     static int frameNum = 0;
     frameNum++;
@@ -1135,11 +1227,18 @@ void displayFunc() {
 
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
-    glTranslatef(0.0f, 0.0f, -g_distance);
-    glRotatef(g_angleX, 1.0f, 0.0f, 0.0f);
-    glRotatef(g_angleY, 0.0f, 1.0f, 0.0f);
+
+    float dirX, dirY, dirZ;
+    float upX, upY, upZ;
+    float rightX, rightY, rightZ;
+    getCameraBasis(dirX, dirY, dirZ, upX, upY, upZ, rightX, rightY, rightZ);
+
+    gluLookAt(
+        g_camX,             g_camY,             g_camZ,
+        g_camX + dirX,      g_camY + dirY,      g_camZ + dirZ,
+        upX, upY, upZ);
+
     glScalef(g_sceneScale, g_sceneScale, g_sceneScale);
-    glTranslatef(-g_centerX, -g_centerY, -g_centerZ);
 
     glEnable(GL_DEPTH_TEST);
     
@@ -1233,29 +1332,43 @@ void mouseFunc(int button, int state, int x, int y) {
             g_leftDown = false;
         }
     }
-    // Mouse wheel
+    // Mouse wheel adjusts movement speed
     if(button == 3 && state == GLUT_DOWN) {
-        g_distance = std::max(0.1f, g_distance - 0.1f);
+        g_moveSpeed = std::min(1.0f, g_moveSpeed * 1.2f);
+        std::cout << "moveSpeed = " << g_moveSpeed << std::endl;
         glutPostRedisplay();
     }
     if(button == 4 && state == GLUT_DOWN) {
-        g_distance += 0.1f;
+        g_moveSpeed = std::max(0.005f, g_moveSpeed / 1.2f);
+        std::cout << "moveSpeed = " << g_moveSpeed << std::endl;
         glutPostRedisplay();
     }
 }
 
 void motionFunc(int x, int y) {
-    if(!g_leftDown) return;
     int dx = x - g_lastX;
     int dy = y - g_lastY;
-    g_angleY += dx * 0.5f;
-    g_angleX += dy * 0.5f;
     g_lastX = x;
     g_lastY = y;
+
+    if(!g_leftDown) return;
+
+    g_angleY += dx * 0.5f;
+    g_angleX += dy * 0.5f;
+
+    if(g_angleY > 360.0f || g_angleY < -360.0f) {
+        g_angleY = std::fmod(g_angleY, 360.0f);
+    }
+    if(g_angleX > 360.0f || g_angleX < -360.0f) {
+        g_angleX = std::fmod(g_angleX, 360.0f);
+    }
+
     glutPostRedisplay();
 }
 
 void keyboardFunc(unsigned char key, int, int) {
+    const float deg2rad = 3.14159265f / 180.0f;
+
     switch(key) {
         case 27: // ESC
             if(g_app) {
@@ -1264,6 +1377,42 @@ void keyboardFunc(unsigned char key, int, int) {
             cleanupGLBuffers();
             std::exit(0);
             break;
+        case 'w':
+        case 'W': {
+            float yaw = g_angleY * deg2rad;
+            g_camX += std::sin(yaw) * g_moveSpeed;
+            g_camZ += std::cos(yaw) * g_moveSpeed;
+            break;
+        }
+        case 's':
+        case 'S': {
+            float yaw = g_angleY * deg2rad;
+            g_camX -= std::sin(yaw) * g_moveSpeed;
+            g_camZ -= std::cos(yaw) * g_moveSpeed;
+            break;
+        }
+        case 'a':
+        case 'A': {
+            float yaw = g_angleY * deg2rad;
+            g_camX -= std::cos(yaw) * g_moveSpeed;
+            g_camZ += std::sin(yaw) * g_moveSpeed;
+            break;
+        }
+        case 'd':
+        case 'D': {
+            float yaw = g_angleY * deg2rad;
+            g_camX += std::cos(yaw) * g_moveSpeed;
+            g_camZ -= std::sin(yaw) * g_moveSpeed;
+            break;
+        }
+        case 'q':
+        case 'Q':
+            g_roll = std::max(-45.0f, g_roll - 2.0f);
+            break;
+        case 'e':
+        case 'E':
+            g_roll = std::min(45.0f, g_roll + 2.0f);
+            break;
         case 'p':
         case 'P':
             g_drawPoints = !g_drawPoints;
@@ -1271,7 +1420,6 @@ void keyboardFunc(unsigned char key, int, int) {
             break;
         case 'm':
         case 'M':
-            // Cycle through mesh modes: FILL -> WIREFRAME -> OFF -> FILL
             g_meshMode = static_cast<MeshDisplayMode>((g_meshMode + 1) % 3);
             if(g_meshMode == MESH_OFF) {
                 std::cout << "Mesh: OFF" << std::endl;
@@ -1309,16 +1457,13 @@ void keyboardFunc(unsigned char key, int, int) {
             g_holePerimeter = std::max(0.1f, g_holePerimeter - 0.1f);
             std::cout << "holePerimeter=" << g_holePerimeter << " m" << std::endl;
             break;
-        case 'w':
-        case 'W':
-            g_distance = std::max(0.1f, g_distance - 0.1f);
+        case 'r':
+        case 'R':
+            resetCameraPose();
+            std::cout << "[Camera] Reset to default view" << std::endl;
             break;
-        case 's':
-        case 'S':
-            g_distance += 0.1f;
-            break;
-        case 'a':
-        case 'A':
+        case 't':
+        case 'T':
             g_autoRotate = !g_autoRotate;
             std::cout << "Auto-rotate: " << (g_autoRotate ? "ON" : "OFF") << std::endl;
             break;
@@ -1340,16 +1485,35 @@ void keyboardFunc(unsigned char key, int, int) {
     glutPostRedisplay();
 }
 
+void specialFunc(int key, int, int) {
+    switch(key) {
+        case GLUT_KEY_UP:
+            g_camY += g_moveSpeed;
+            break;
+        case GLUT_KEY_DOWN:
+            g_camY -= g_moveSpeed;
+            break;
+        default:
+            return;
+    }
+    glutPostRedisplay();
+}
+
 void printControls() {
     std::cout << "\n==================== CONTROLS ====================\n";
-    std::cout << "  Mouse drag      : Rotate view\n";
-    std::cout << "  Mouse wheel     : Zoom in/out\n";
-    std::cout << "  W / S           : Zoom in/out\n";
+    std::cout << "  Mouse drag (L)  : Look around (yaw/pitch)\n";
+    std::cout << "  Mouse wheel     : Change move speed\n";
+    std::cout << "  W / S           : Move forward / backward\n";
+    std::cout << "  A / D           : Strafe left / right\n";
+    std::cout << "  Q / E           : Roll left / right\n";
+    std::cout << "  Arrow Up/Down   : Move up / down\n";
     std::cout << "  P               : Toggle points display\n";
     std::cout << "  M               : Cycle mesh mode (FILL/WIREFRAME/OFF)\n";
     std::cout << "  [ / ]           : Adjust mesh edge factor\n";
     std::cout << "  - / =           : Adjust mesh pixel stride\n";
-    std::cout << "  A               : Toggle auto-rotate\n";
+    std::cout << "  , / .           : Adjust hole patch perimeter\n";
+    std::cout << "  R               : Reset camera to default view\n";
+    std::cout << "  T               : Toggle auto-rotate\n";
     std::cout << "  SPACE           : Pause/Resume\n";
     std::cout << "  C               : Capture (save current frame)\n";
     std::cout << "  ESC             : Exit\n";
@@ -1365,6 +1529,8 @@ int main(int argc, char** argv) {
 
     RealtimeMeshReconstruction app;
     g_app = &app;
+
+    resetCameraPose();
 
     // Initialize Orbbec SDK
     if(!app.initializeOrbbecSDK()) {
@@ -1401,6 +1567,7 @@ int main(int argc, char** argv) {
     glutMouseFunc(mouseFunc);
     glutMotionFunc(motionFunc);
     glutKeyboardFunc(keyboardFunc);
+    glutSpecialFunc(specialFunc);
     glutIdleFunc(idleFunc);
 
     printControls();

@@ -12,6 +12,8 @@
 #include <limits>
 #include <unordered_map>
 #include <unordered_set>
+#include <chrono>
+#include <ctime>
 
 // Orbbec SDK
 #include "libobsensor/ObSensor.hpp"
@@ -21,6 +23,8 @@
 #include <pcl/common/common.h>
 #include <pcl/surface/organized_fast_mesh.h>
 #include <pcl/io/ply_io.h>
+#include <pcl/PCLPointCloud2.h>
+#include <pcl/conversions.h>
 
 // OpenGL
 #ifdef _WIN32
@@ -41,6 +45,30 @@ extern float g_holePerimeter;
 void patchSmallMeshHoles(pcl::PointCloud<pcl::PointXYZRGB>::Ptr& cloud,
                          std::vector<pcl::Vertices>& tris,
                          float maxPerimeter);
+
+std::string currentTimestampString() {
+    auto now = std::chrono::system_clock::now();
+    std::time_t nowTime = std::chrono::system_clock::to_time_t(now);
+    std::tm tmBuf{};
+#ifdef _WIN32
+    localtime_s(&tmBuf, &nowTime);
+#else
+    localtime_r(&nowTime, &tmBuf);
+#endif
+    char buffer[32];
+    std::strftime(buffer, sizeof(buffer), "%Y%m%d_%H%M%S", &tmBuf);
+    return std::string(buffer);
+}
+
+std::string appendTimestampToFilename(const std::string& filename) {
+    std::string stamp = currentTimestampString();
+    auto posSlash = filename.find_last_of("/\\");
+    auto posDot = filename.find_last_of('.');
+    if(posDot == std::string::npos || (posSlash != std::string::npos && posDot < posSlash)) {
+        return filename + "_" + stamp;
+    }
+    return filename.substr(0, posDot) + "_" + stamp + filename.substr(posDot);
+}
 
 //==================== Real-time Mesh Reconstruction Class ====================
 
@@ -623,6 +651,9 @@ public:
         {
             std::lock_guard<std::recursive_mutex> lock(cloudMutex);
             mesh.polygons.swap(tris);
+            pcl::PCLPointCloud2 cloud2;
+            pcl::toPCLPointCloud2(*used, cloud2);
+            mesh.cloud = std::move(cloud2);
             *cloud_for_mesh = *used;  // Save the cloud snapshot used to build this mesh
             meshStamp = stamp_at_start;
         }
@@ -640,8 +671,13 @@ public:
 
     void saveMesh(const std::string& filename) {
         std::lock_guard<std::recursive_mutex> lock(cloudMutex);
-        std::cout << "Saving mesh to: " << filename << std::endl;
-        pcl::io::savePLYFile(filename, mesh);
+        if(mesh.cloud.data.empty()) {
+            std::cerr << "[SaveMesh] Mesh has no vertex cloud; aborting write." << std::endl;
+            return;
+        }
+        const std::string stampedName = appendTimestampToFilename(filename);
+        std::cout << "Saving mesh to: " << stampedName << std::endl;
+        pcl::io::savePLYFile(stampedName, mesh);
         std::cout << "Mesh saved with " << mesh.polygons.size() << " triangles" << std::endl;
     }
 

@@ -362,8 +362,8 @@ public:
                 pcl::PointXYZRGB &p = newCloud->points[i];
                 
                 // Convert from mm to meters
-                p.x = points[i].x / 1000.0f;
-                p.y = points[i].y / 1000.0f;
+                p.x = -points[i].x / 1000.0f;
+                p.y = -points[i].y / 1000.0f;
                 p.z = points[i].z / 1000.0f;
                 p.r = points[i].r;
                 p.g = points[i].g;
@@ -390,8 +390,8 @@ public:
                 pcl::PointXYZRGB &p = newCloud->points[i];
                 
                 // Convert from mm to meters
-                p.x = points[i].x / 1000.0f;
-                p.y = points[i].y / 1000.0f;
+                p.x = -points[i].x / 1000.0f;
+                p.y = -points[i].y / 1000.0f;
                 p.z = points[i].z / 1000.0f;
                 
                 // Use grayscale for depth-only mode (map depth to color)
@@ -1391,15 +1391,15 @@ void keyboardFunc(unsigned char key, int, int) {
             g_camZ -= std::cos(yaw) * g_moveSpeed;
             break;
         }
-        case 'a':
-        case 'A': {
+        case 'd':
+        case 'D': {
             float yaw = g_angleY * deg2rad;
             g_camX -= std::cos(yaw) * g_moveSpeed;
             g_camZ += std::sin(yaw) * g_moveSpeed;
             break;
         }
-        case 'd':
-        case 'D': {
+        case 'a':
+        case 'A': {
             float yaw = g_angleY * deg2rad;
             g_camX += std::cos(yaw) * g_moveSpeed;
             g_camZ -= std::sin(yaw) * g_moveSpeed;

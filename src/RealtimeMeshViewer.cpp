@@ -10,10 +10,12 @@
 #include <thread>
 #include <mutex>
 #include <limits>
-#include <unordered_map>
-#include <unordered_set>
 #include <chrono>
 #include <ctime>
+#include <cstdlib>
+#include <string>
+#include <sstream>
+#include <iomanip>
 
 // Orbbec SDK
 #include "libobsensor/ObSensor.hpp"
@@ -40,11 +42,21 @@ extern float g_edgeFactor;
 extern int   g_pixStride;
 extern float g_dzMax;
 extern float g_holePerimeter;
+extern std::atomic<bool> g_paused;
+extern bool  g_planeFillEnabled;
 
-// Forward declaration for mesh hole patching helper
+// Forward declaration for mesh hole patching helper (fast neighbor interpolation)
 void patchSmallMeshHoles(pcl::PointCloud<pcl::PointXYZRGB>::Ptr& cloud,
-                         std::vector<pcl::Vertices>& tris,
-                         float maxPerimeter);
+                         int stride,
+                         float maxNeighborDist);
+
+// Forward declaration for large-plane-based hole filling
+void fillLargeHolesWithPlane(pcl::PointCloud<pcl::PointXYZRGB>::Ptr& cloud,
+                             int stride,
+                             float spacing);
+
+// Global toggle: whether hole patching (small + plane) is enabled
+bool g_holePatchEnabled = true;
 
 std::string currentTimestampString() {
     auto now = std::chrono::system_clock::now();
@@ -84,6 +96,9 @@ private:
     std::recursive_mutex cloudMutex;
     std::atomic<bool> hasNewData{false};
     std::atomic<bool> shouldStop{false};
+    std::atomic<bool> cloudUpdated{false};
+    std::atomic<bool> meshReady{false};
+    std::thread meshThread;
     
     // Consistency buffers - keep mesh and cloud in sync
     pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud_for_mesh; // cloud snapshot used to build 'mesh'
@@ -95,6 +110,14 @@ private:
     std::unique_ptr<ob::PointCloudFilter> pointCloudFilter;
     std::thread captureThread;
     bool hasColorSensor;
+
+    // Latest image buffers for UI display
+    std::vector<uint8_t> latestRgbImage;
+    std::vector<uint8_t> latestDepthImage;
+    std::mutex imageMutex;
+    std::atomic<bool> imagesReady{false};
+    int imageW{0};
+    int imageH{0};
 
 public:
     RealtimeMeshReconstruction() {
@@ -252,6 +275,7 @@ public:
         std::cout << "Starting capture thread..." << std::endl;
         shouldStop = false;
         captureThread = std::thread(&RealtimeMeshReconstruction::captureLoop, this);
+        meshThread = std::thread(&RealtimeMeshReconstruction::meshLoop, this);
     }
 
     void stopCapture() {
@@ -259,6 +283,9 @@ public:
             std::cout << "Stopping capture thread..." << std::endl;
             shouldStop = true;
             captureThread.join();
+        }
+        if(meshThread.joinable()) {
+            meshThread.join();
         }
         if(pipeline) {
             pipeline->stop();
@@ -323,7 +350,7 @@ public:
                 frameCount++;
                 
                 if(frameCount == 1) {
-                    std::cout << "✓ First point cloud generated successfully!" << std::endl;
+                    std::cout << "[OK] First point cloud generated successfully!" << std::endl;
                     std::cout << "  Skipped " << skippedFrames << " incomplete frames" << std::endl;
                 }
                 else if(frameCount % 100 == 0) {
@@ -364,11 +391,6 @@ public:
         newCloud->height = height;
         newCloud->is_dense = false;
         newCloud->points.resize(width * height);
-        // Initialize all points to NaN to avoid (0,0,0) defaults being used
-        for(auto &p : newCloud->points) {
-            p.x = p.y = p.z = std::numeric_limits<float>::quiet_NaN();
-            p.r = p.g = p.b = 0;
-        }
         
         static const auto min_distance = 1e-6;
         
@@ -404,6 +426,12 @@ public:
                     p.x = p.y = p.z = std::numeric_limits<float>::quiet_NaN();
                 }
             }
+            // Mark any trailing points (if pointsSize < width*height) as invalid
+            for(int i = pointsSize; i < width * height; ++i) {
+                pcl::PointXYZRGB &p = newCloud->points[i];
+                p.x = p.y = p.z = std::numeric_limits<float>::quiet_NaN();
+                p.r = p.g = p.b = 0;
+            }
         }
         else {
             // Process depth-only point cloud
@@ -436,12 +464,43 @@ public:
                     p.x = p.y = p.z = std::numeric_limits<float>::quiet_NaN();
                 }
             }
+            for(int i = pointsSize; i < width * height; ++i) {
+                pcl::PointXYZRGB &p = newCloud->points[i];
+                p.x = p.y = p.z = std::numeric_limits<float>::quiet_NaN();
+                p.r = p.g = p.b = 0;
+            }
         }
         
         // Count valid points
         int validPoints = 0;
         for(const auto& p : newCloud->points) {
             if(!std::isnan(p.x)) validPoints++;
+        }
+
+        // Prepare 2D RGB/depth previews for UI panels
+        std::vector<uint8_t> rgbImage;
+        std::vector<uint8_t> depthImage;
+        if(width > 0 && height > 0) {
+            const size_t imgSize = static_cast<size_t>(width) * height * 3;
+            rgbImage.resize(imgSize);
+            depthImage.resize(imgSize);
+            for(size_t i = 0; i < newCloud->points.size(); ++i) {
+                const auto& p = newCloud->points[i];
+                const size_t idx = i * 3;
+                rgbImage[idx + 0] = p.r;
+                rgbImage[idx + 1] = p.g;
+                rgbImage[idx + 2] = p.b;
+
+                uint8_t depthGray = 0;
+                if(pcl::isFinite(p)) {
+                    const float depthMm = p.z * 1000.0f;
+                    const float clamped = std::min(std::max(depthMm, 0.0f), 4000.0f);
+                    depthGray = static_cast<uint8_t>(255.0f * (1.0f - clamped / 4000.0f));
+                }
+                depthImage[idx + 0] = depthGray;
+                depthImage[idx + 1] = depthGray;
+                depthImage[idx + 2] = depthGray;
+            }
         }
         
         // Thread-safe update
@@ -450,17 +509,61 @@ public:
             cloud = newCloud;
             ++cloudStamp;  // Increment frame stamp
             hasNewData = true;
+            cloudUpdated = true;
+        }
+        if(!rgbImage.empty() && !depthImage.empty()) {
+            std::lock_guard<std::mutex> imgLock(imageMutex);
+            imageW = width;
+            imageH = height;
+            latestRgbImage.swap(rgbImage);
+            latestDepthImage.swap(depthImage);
+            imagesReady = true;
         }
         
         if(firstUpdate) {
-            std::cout << "✓ Point cloud updated! Valid points: " << validPoints 
+            std::cout << "[OK] Point cloud updated! Valid points: " << validPoints 
                       << " / " << (width * height) << std::endl;
             firstUpdate = false;
         }
     }
 
+    void meshLoop() {
+        while(!shouldStop) {
+            if(cloudUpdated.exchange(false)) {
+                reconstructMesh();
+                meshReady = true;
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+    }
+
     bool hasNewDataAvailable() {
         return hasNewData.exchange(false);
+    }
+
+    bool hasNewMeshAvailable() {
+        return meshReady.exchange(false);
+    }
+
+    bool getLatestImages(std::vector<uint8_t>& rgbOut,
+                         std::vector<uint8_t>& depthOut,
+                         int &outW,
+                         int &outH,
+                         bool &hasColorOut) {
+        if(!imagesReady.exchange(false)) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(imageMutex);
+        if(imageW == 0 || imageH == 0) {
+            return false;
+        }
+        rgbOut = latestRgbImage;
+        depthOut = latestDepthImage;
+        outW = imageW;
+        outH = imageH;
+        hasColorOut = hasColorSensor;
+        return true;
     }
 
     float estimateNeighborSpacing() {
@@ -527,21 +630,21 @@ public:
             return;
         }
 
-        // Count valid points
-        int validPoints = 0;
-        for(const auto& p : used->points) {
-            if(pcl::isFinite(p)) validPoints++;
-        }
-        
         if(firstReconstruct) {
+            int validPoints = 0;
+            for(const auto& p : used->points) {
+                if(pcl::isFinite(p)) validPoints++;
+            }
             std::cout << "[Mesh] Cloud dimensions: " << W << "x" << H << std::endl;
             std::cout << "[Mesh] Valid points: " << validPoints << " / " << used->points.size() 
                       << " (" << (100.0f * validPoints / used->points.size()) << "%)" << std::endl;
         }
 
-        // Estimate spacing from the snapshot (compute locally to avoid lock)
-        float spacing = 0.0f;
-        if(W > 1 && H > 1) {
+        // Estimate spacing from the snapshot (compute locally to avoid lock) with caching
+        static float cachedSpacing = 0.0f;
+        static int spacingRefreshCounter = 0;
+        auto computeSpacing = [&]() -> float {
+            if(W <= 1 || H <= 1) return 0.0f;
             std::vector<float> dists;
             dists.reserve(10000);
             int stepRow = std::max(1, H / 200);
@@ -568,15 +671,29 @@ public:
                 }
                 if(dists.size() >= 10000) break;
             }
-            if(!dists.empty()) {
-                std::nth_element(dists.begin(), dists.begin() + dists.size() / 2, dists.end());
-                spacing = dists[dists.size() / 2];
-            }
+            if(dists.empty()) return 0.0f;
+            std::nth_element(dists.begin(), dists.begin() + dists.size() / 2, dists.end());
+            return dists[dists.size() / 2];
+        };
+
+        if(spacingRefreshCounter == 0 || spacingRefreshCounter % 60 == 0 || cachedSpacing <= 0.0f) {
+            cachedSpacing = computeSpacing();
         }
+        spacingRefreshCounter++;
+
+        float spacing = cachedSpacing;
         if(spacing <= 0.0f) spacing = 0.01f;
 
         // Manual grid triangulation with stride
         const int s = std::max(1, g_pixStride);
+
+        // Hole patching (small neighbor + plane) guarded by toggle
+        if(g_holePatchEnabled) {
+            patchSmallMeshHoles(used, s, g_holePerimeter);
+        }
+        if(g_planeFillEnabled) {
+            fillLargeHolesWithPlane(used, s, spacing);
+        }
 
         // For neighbors after stride, actual adjacent distance is approximately spacing * s
         float strideSpacing = spacing * static_cast<float>(s);
@@ -644,9 +761,6 @@ public:
             max_kept = std::max({max_kept, L(i0,i1), L(i1,i2), L(i2,i0)});
         }
 
-        // Patch small mesh holes (perimeter threshold in meters)
-        patchSmallMeshHoles(used, tris, g_holePerimeter);
-
         // Publish mesh + cloud_for_mesh atomically (keep them in sync)
         {
             std::lock_guard<std::recursive_mutex> lock(cloudMutex);
@@ -659,12 +773,14 @@ public:
         }
 
         reconstructCount++;
-        std::cout << "[Mesh] #" << reconstructCount
-                  << " stride=" << s
-                  << " spacing=" << spacing
-                  << " maxEdge=" << maxDistance
-                  << " tris=" << mesh.polygons.size()
-                  << " maxEdgeKept=" << max_kept << std::endl;
+        if(!g_paused) {
+            std::cout << "[Mesh] #" << reconstructCount
+                      << " stride=" << s
+                      << " spacing=" << spacing
+                      << " maxEdge=" << maxDistance
+                      << " tris=" << mesh.polygons.size()
+                      << " maxEdgeKept=" << max_kept << std::endl;
+        }
 
         firstReconstruct = false;
     }
@@ -711,204 +827,329 @@ public:
 
 //==================== Mesh hole patching (small holes only) ====================
 
-struct EdgeKey {
-    uint32_t a{0}, b{0};
-    EdgeKey() = default;
-    EdgeKey(uint32_t i, uint32_t j) {
-        if(i < j) { a = i; b = j; }
-        else      { a = j; b = i; }
-    }
-    bool operator==(const EdgeKey& other) const noexcept {
-        return a == other.a && b == other.b;
-    }
-};
-
-struct EdgeKeyHash {
-    std::size_t operator()(const EdgeKey& k) const noexcept {
-        return (static_cast<std::size_t>(k.a) << 32) ^ static_cast<std::size_t>(k.b);
-    }
-};
-
 void patchSmallMeshHoles(pcl::PointCloud<pcl::PointXYZRGB>::Ptr& cloud,
-                         std::vector<pcl::Vertices>& tris,
-                         float maxPerimeter)
+                         int stride,
+                         float maxNeighborDist)
 {
-    if(!cloud || tris.empty()) return;
+    if(!cloud || stride <= 0) return;
+
+    const int W = static_cast<int>(cloud->width);
+    const int H = static_cast<int>(cloud->height);
+    if(W <= 0 || H <= 0 || cloud->points.size() != static_cast<size_t>(W * H)) return;
+
     auto &pts = cloud->points;
+    const int step    = stride;      // horizontal / vertical stride step
+    const int rowStep = stride * W;  // stride rows to index step
+    const float maxNeighborDist2 = (maxNeighborDist > 0.0f)
+        ? (maxNeighborDist * maxNeighborDist)
+        : std::numeric_limits<float>::max();
+    int patched = 0;
 
-    struct EdgeInfo {
-        uint32_t a{0}, b{0};
-        int count{0};
+    auto dist2 = [&](const pcl::PointXYZRGB& a, const pcl::PointXYZRGB& b)->float {
+        float dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
+        return dx*dx + dy*dy + dz*dz;
     };
 
-    std::unordered_map<EdgeKey, EdgeInfo, EdgeKeyHash> edgeMap;
-    edgeMap.reserve(tris.size() * 3);
+    // Only scan stride-aligned coordinates (same as triangulation samples)
+    for(int r = 0; r < H; r += step) {
+        for(int c = 0; c < W; c += step) {
+            int idx = r * W + c;
+            if(pcl::isFinite(pts[idx])) continue;
 
-    auto addEdge = [&](uint32_t i0, uint32_t i1) {
-        EdgeKey key(i0, i1);
-        auto it = edgeMap.find(key);
-        if(it == edgeMap.end()) {
-            edgeMap.emplace(key, EdgeInfo{key.a, key.b, 1});
-        } else {
-            it->second.count++;
-        }
-    };
+            bool hasLeft  = (c - step) >= 0 && pcl::isFinite(pts[idx - step]);
+            bool hasRight = (c + step) < W  && pcl::isFinite(pts[idx + step]);
+            bool hasUp    = (r - step) >= 0 && (idx - rowStep) >= 0 &&
+                            pcl::isFinite(pts[idx - rowStep]);
+            bool hasDown  = (r + step) < H  && (idx + rowStep) < static_cast<int>(pts.size()) &&
+                            pcl::isFinite(pts[idx + rowStep]);
 
-    for(const auto& tri : tris) {
-        if(tri.vertices.size() != 3) continue;
-        uint32_t i0 = tri.vertices[0];
-        uint32_t i1 = tri.vertices[1];
-        uint32_t i2 = tri.vertices[2];
-        addEdge(i0, i1);
-        addEdge(i1, i2);
-        addEdge(i2, i0);
-    }
+            if(!(hasLeft || hasRight || hasUp || hasDown)) continue;
 
-    std::vector<std::pair<uint32_t, uint32_t>> boundaryEdges;
-    boundaryEdges.reserve(edgeMap.size());
-    for(const auto& kv : edgeMap) {
-        const EdgeInfo& info = kv.second;
-        if(info.count == 1) {
-            boundaryEdges.emplace_back(info.a, info.b);
-        }
-    }
+            pcl::PointXYZRGB p{};
+            int count = 0;
 
-    if(boundaryEdges.empty()) return;
-
-    std::unordered_map<uint32_t, std::vector<uint32_t>> adj;
-    adj.reserve(boundaryEdges.size() * 2);
-    for(const auto& e : boundaryEdges) {
-        adj[e.first].push_back(e.second);
-        adj[e.second].push_back(e.first);
-    }
-
-    auto edgeKeyUint64 = [](uint32_t i, uint32_t j) -> uint64_t {
-        if(i > j) std::swap(i, j);
-        return (static_cast<uint64_t>(i) << 32) | static_cast<uint64_t>(j);
-    };
-
-    std::unordered_set<uint64_t> usedEdges;
-    usedEdges.reserve(boundaryEdges.size() * 2);
-
-    size_t patchedLoops = 0;
-
-    for(const auto& e : boundaryEdges) {
-        uint32_t a = e.first;
-        uint32_t b = e.second;
-        uint64_t key = edgeKeyUint64(a, b);
-        if(usedEdges.count(key)) continue;
-
-        std::vector<uint32_t> loop;
-        loop.reserve(32);
-        loop.push_back(a);
-        loop.push_back(b);
-        usedEdges.insert(key);
-
-        uint32_t prev = a;
-        uint32_t curr = b;
-        bool closed = false;
-
-        while(true) {
-            auto itAdj = adj.find(curr);
-            if(itAdj == adj.end()) break;
-
-            uint32_t next = std::numeric_limits<uint32_t>::max();
-            for(uint32_t candidate : itAdj->second) {
-                if(candidate == prev) continue;
-                uint64_t key2 = edgeKeyUint64(curr, candidate);
-                if(!usedEdges.count(key2)) {
-                    next = candidate;
-                    usedEdges.insert(key2);
-                    break;
+            // 4-neighbor average (preferred)
+            if(hasLeft && hasRight && hasUp && hasDown) {
+                if(dist2(pts[idx - step],    pts[idx + step])    < maxNeighborDist2 &&
+                   dist2(pts[idx - rowStep], pts[idx + rowStep]) < maxNeighborDist2) {
+                    p.x = (pts[idx - step].x    + pts[idx + step].x
+                         + pts[idx - rowStep].x + pts[idx + rowStep].x) * 0.25f;
+                    p.y = (pts[idx - step].y    + pts[idx + step].y
+                         + pts[idx - rowStep].y + pts[idx + rowStep].y) * 0.25f;
+                    p.z = (pts[idx - step].z    + pts[idx + step].z
+                         + pts[idx - rowStep].z + pts[idx + rowStep].z) * 0.25f;
+                    p.r = static_cast<uint8_t>((pts[idx - step].r    + pts[idx + step].r
+                                              + pts[idx - rowStep].r + pts[idx + rowStep].r) >> 2);
+                    p.g = static_cast<uint8_t>((pts[idx - step].g    + pts[idx + step].g
+                                              + pts[idx - rowStep].g + pts[idx + rowStep].g) >> 2);
+                    p.b = static_cast<uint8_t>((pts[idx - step].b    + pts[idx + step].b
+                                              + pts[idx - rowStep].b + pts[idx + rowStep].b) >> 2);
+                    count = 4;
                 }
             }
 
-            if(next == std::numeric_limits<uint32_t>::max()) break;
-
-            if(next == loop.front()) {
-                closed = true;
-                break;
+            // Horizontal interpolation
+            if(count == 0 && hasLeft && hasRight) {
+                if(dist2(pts[idx - step], pts[idx + step]) < maxNeighborDist2) {
+                    p.x = (pts[idx - step].x + pts[idx + step].x) * 0.5f;
+                    p.y = (pts[idx - step].y + pts[idx + step].y) * 0.5f;
+                    p.z = (pts[idx - step].z + pts[idx + step].z) * 0.5f;
+                    p.r = static_cast<uint8_t>((pts[idx - step].r + pts[idx + step].r) >> 1);
+                    p.g = static_cast<uint8_t>((pts[idx - step].g + pts[idx + step].g) >> 1);
+                    p.b = static_cast<uint8_t>((pts[idx - step].b + pts[idx + step].b) >> 1);
+                    count = 2;
+                }
             }
 
-            loop.push_back(next);
-            prev = curr;
-            curr = next;
+            // Vertical interpolation
+            if(count == 0 && hasUp && hasDown) {
+                if(dist2(pts[idx - rowStep], pts[idx + rowStep]) < maxNeighborDist2) {
+                    p.x = (pts[idx - rowStep].x + pts[idx + rowStep].x) * 0.5f;
+                    p.y = (pts[idx - rowStep].y + pts[idx + rowStep].y) * 0.5f;
+                    p.z = (pts[idx - rowStep].z + pts[idx + rowStep].z) * 0.5f;
+                    p.r = static_cast<uint8_t>((pts[idx - rowStep].r + pts[idx + rowStep].r) >> 1);
+                    p.g = static_cast<uint8_t>((pts[idx - rowStep].g + pts[idx + rowStep].g) >> 1);
+                    p.b = static_cast<uint8_t>((pts[idx - rowStep].b + pts[idx + rowStep].b) >> 1);
+                    count = 2;
+                }
+            }
 
-            if(loop.size() > 512) {
-                closed = false;
-                break;
+            if(count > 0) {
+                pts[idx] = p;
+                patched++;
             }
         }
+    }
+}
 
-        if(!closed || loop.size() < 3) continue;
+void fillLargeHolesWithPlane(pcl::PointCloud<pcl::PointXYZRGB>::Ptr& cloud,
+                             int stride,
+                             float spacing)
+{
+    if(!cloud || stride <= 0 || !g_planeFillEnabled) return;
 
-        float perimeter = 0.0f;
-        bool perimeterInvalid = false;
-        for(size_t i = 0; i < loop.size(); ++i) {
-            uint32_t i0 = loop[i];
-            uint32_t i1 = loop[(i + 1) % loop.size()];
-            const auto& p0 = pts[i0];
-            const auto& p1 = pts[i1];
-            if(!pcl::isFinite(p0) || !pcl::isFinite(p1)) {
-                perimeterInvalid = true;
-                break;
+    const int W = static_cast<int>(cloud->width);
+    const int H = static_cast<int>(cloud->height);
+    if(W <= 0 || H <= 0 || cloud->points.size() != static_cast<size_t>(W * H)) return;
+
+    auto &pts = cloud->points;
+
+    // ---- 1) Sample finite points and run a lightweight RANSAC plane fit ----
+    std::vector<int> sampleIdx;
+    sampleIdx.reserve(4000);
+
+    const int sampleStep = stride * 4;  // coarser sampling to reduce cost
+    for(int r = 0; r < H; r += sampleStep) {
+        for(int c = 0; c < W; c += sampleStep) {
+            int idx = r * W + c;
+            if(pcl::isFinite(pts[idx])) {
+                sampleIdx.push_back(idx);
             }
-            float dx = p0.x - p1.x;
-            float dy = p0.y - p1.y;
-            float dz = p0.z - p1.z;
-            perimeter += std::sqrt(dx*dx + dy*dy + dz*dz);
         }
-        if(perimeterInvalid || perimeter > maxPerimeter) continue;
-
-        pcl::PointXYZRGB center;
-        center.x = center.y = center.z = 0.0f;
-        int cntValid = 0;
-        int sumR = 0, sumG = 0, sumB = 0;
-        for(uint32_t vid : loop) {
-            const auto& p = pts[vid];
-            if(!pcl::isFinite(p)) continue;
-            center.x += p.x;
-            center.y += p.y;
-            center.z += p.z;
-            sumR += p.r;
-            sumG += p.g;
-            sumB += p.b;
-            cntValid++;
-        }
-        if(cntValid < 3) continue;
-
-        center.x /= cntValid;
-        center.y /= cntValid;
-        center.z /= cntValid;
-        center.r = static_cast<uint8_t>(sumR / cntValid);
-        center.g = static_cast<uint8_t>(sumG / cntValid);
-        center.b = static_cast<uint8_t>(sumB / cntValid);
-
-        uint32_t centerIdx = static_cast<uint32_t>(pts.size());
-        pts.push_back(center);
-        cloud->width = static_cast<uint32_t>(pts.size());
-        cloud->height = 1;
-        cloud->is_dense = false;
-
-        for(size_t i = 0; i < loop.size(); ++i) {
-            uint32_t v0 = loop[i];
-            uint32_t v1 = loop[(i + 1) % loop.size()];
-            if(v0 == v1 || v0 == centerIdx || v1 == centerIdx) continue;
-            pcl::Vertices tri;
-            tri.vertices.resize(3);
-            tri.vertices[0] = centerIdx;
-            tri.vertices[1] = v0;
-            tri.vertices[2] = v1;
-            tris.push_back(std::move(tri));
-        }
-
-        patchedLoops++;
+    }
+    if(sampleIdx.size() < 50) {
+        return; // not enough samples for plane fitting
     }
 
-    if(patchedLoops > 0) {
-        std::cout << "[MeshHole] patched loops=" << patchedLoops
-                  << " newPoints=" << pts.size()
-                  << " trisAfter=" << tris.size() << std::endl;
+    auto randIdx = [&](int n) -> int {
+        return std::rand() % n;
+    };
+
+    struct Plane {
+        float a{}, b{}, c{}, d{};
+        int inliers{};
+    };
+
+    const int   maxIter     = 80;
+    const float distThresh  = std::max(0.01f, spacing * 2.0f); // inlier distance threshold
+    const float distThresh2 = distThresh * distThresh;
+    const int   maxPlanes   = 3;
+
+    auto findPlane = [&](const std::vector<int>& pool,
+                         Plane& outPlane,
+                         std::vector<int>& outInliers)->bool {
+        if(pool.size() < 30) return false;
+        int bestInlierCount = 0;
+        float bestA = 0.f, bestB = 0.f, bestC = 1.f, bestD = 0.f;
+        for(int iter = 0; iter < maxIter; ++iter) {
+            int i1 = randIdx(static_cast<int>(pool.size()));
+            int i2 = randIdx(static_cast<int>(pool.size()));
+            int i3 = randIdx(static_cast<int>(pool.size()));
+            if(i1 == i2 || i1 == i3 || i2 == i3) continue;
+            const auto &p1 = pts[pool[i1]];
+            const auto &p2 = pts[pool[i2]];
+            const auto &p3 = pts[pool[i3]];
+            if(!pcl::isFinite(p1) || !pcl::isFinite(p2) || !pcl::isFinite(p3)) continue;
+            float ux = p2.x - p1.x, uy = p2.y - p1.y, uz = p2.z - p1.z;
+            float vx = p3.x - p1.x, vy = p3.y - p1.y, vz = p3.z - p1.z;
+            float nx = uy * vz - uz * vy;
+            float ny = uz * vx - ux * vz;
+            float nz = ux * vy - uy * vx;
+            float norm2 = nx*nx + ny*ny + nz*nz;
+            if(norm2 < 1e-6f) continue;
+            float invNorm = 1.0f / std::sqrt(norm2);
+            nx *= invNorm; ny *= invNorm; nz *= invNorm;
+            float d = -(nx * p1.x + ny * p1.y + nz * p1.z);
+            int inlierCount = 0;
+            for(int idx : pool) {
+                const auto &q = pts[idx];
+                float dist = nx * q.x + ny * q.y + nz * q.z + d;
+                if(dist * dist < distThresh2) {
+                    ++inlierCount;
+                }
+            }
+            if(inlierCount > bestInlierCount) {
+                bestInlierCount = inlierCount;
+                bestA = nx; bestB = ny; bestC = nz; bestD = d;
+            }
+        }
+        if(bestInlierCount < static_cast<int>(pool.size() * 0.3f)) {
+            return false;
+        }
+        outInliers.clear();
+        outInliers.reserve(pool.size());
+        for(int idx : pool) {
+            const auto &q = pts[idx];
+            float dist = bestA * q.x + bestB * q.y + bestC * q.z + bestD;
+            if(dist * dist < distThresh2) {
+                outInliers.push_back(idx);
+            }
+        }
+        outPlane = Plane{bestA, bestB, bestC, bestD, static_cast<int>(outInliers.size())};
+        return true;
+    };
+
+    std::vector<int> pool = sampleIdx;
+    std::vector<Plane> planes;
+    planes.reserve(maxPlanes);
+    for(int k = 0; k < maxPlanes && !pool.empty(); ++k) {
+        Plane pl;
+        std::vector<int> inliers;
+        if(!findPlane(pool, pl, inliers)) break;
+        planes.push_back(pl);
+        // Remove inliers from pool for next plane
+        std::sort(inliers.begin(), inliers.end());
+        std::vector<int> newPool;
+        newPool.reserve(pool.size());
+        for(int idx : pool) {
+            if(!std::binary_search(inliers.begin(), inliers.end(), idx)) {
+                newPool.push_back(idx);
+            }
+        }
+        pool.swap(newPool);
+    }
+
+    if(planes.empty()) {
+        return;
+    } else {
+        std::cout << "[PlaneFill] Found " << planes.size() << " plane(s)" << std::endl;
+    }
+
+    // ---- 2) Patch stride-grid holes that align with any detected plane ----
+
+    const int step    = stride;
+    const int rowStep = stride * W;
+    int patched = 0;
+
+    for(int r = 0; r < H; r += step) {
+        for(int c = 0; c < W; c += step) {
+            int idx = r * W + c;
+            if(pcl::isFinite(pts[idx])) continue;  // only patch missing points
+
+            // Collect nearby plane inliers to estimate (x,y)
+            std::vector<const pcl::PointXYZRGB*> neighbors;
+            neighbors.reserve(8);
+
+            auto tryAddNeighbor = [&](int rr, int cc) {
+                if(rr < 0 || rr >= H || cc < 0 || cc >= W) return;
+                int id = rr * W + cc;
+                const auto &q = pts[id];
+                if(!pcl::isFinite(q)) return;
+                for(const auto& pl : planes) {
+                    float dist = pl.a * q.x + pl.b * q.y + pl.c * q.z + pl.d;
+                    if(dist * dist < distThresh2 * 4.0f) { // allow slightly looser band
+                        neighbors.push_back(&q);
+                        break;
+                    }
+                }
+            };
+
+            // Search plane neighbors in a 3x3 stride block
+            for(int dr = -step*2; dr <= step*2; dr += step) {
+                for(int dc = -step*2; dc <= step*2; dc += step) {
+                    if(dr == 0 && dc == 0) continue;
+                    tryAddNeighbor(r + dr, c + dc);
+                }
+            }
+            if(neighbors.size() < 3) continue; // need at least 3 neighbors
+
+            // Estimate (x,y) via neighbor mean; solve z from best matching plane
+            float meanX = 0.f, meanY = 0.f, meanZ = 0.f;
+            uint32_t meanR = 0, meanG = 0, meanB = 0;
+            for(auto q : neighbors) {
+                meanX += q->x;
+                meanY += q->y;
+                meanZ += q->z;
+                meanR += q->r;
+                meanG += q->g;
+                meanB += q->b;
+            }
+            float invN = 1.0f / neighbors.size();
+            meanX *= invN;
+            meanY *= invN;
+            meanZ *= invN;
+            meanR = static_cast<uint32_t>(meanR * invN);
+            meanG = static_cast<uint32_t>(meanG * invN);
+            meanB = static_cast<uint32_t>(meanB * invN);
+
+            // Pick plane that best explains the neighbors
+            int bestPlaneIdx = -1;
+            int bestPlaneSupport = 0;
+            for(size_t pi = 0; pi < planes.size(); ++pi) {
+                int support = 0;
+                const auto& pl = planes[pi];
+                for(auto q : neighbors) {
+                    float dist = pl.a * q->x + pl.b * q->y + pl.c * q->z + pl.d;
+                    if(dist * dist < distThresh2 * 4.0f) {
+                        ++support;
+                    }
+                }
+                if(support > bestPlaneSupport) {
+                    bestPlaneSupport = support;
+                    bestPlaneIdx = static_cast<int>(pi);
+                }
+            }
+            if(bestPlaneIdx < 0) continue;
+            const auto& plane = planes[bestPlaneIdx];
+
+            pcl::PointXYZRGB p{};
+            p.x = meanX;
+            p.y = meanY;
+
+            // If normal z is tiny (near-vertical plane), fall back to meanZ
+            if(std::fabs(plane.c) > 1e-3f) {
+                p.z = -(plane.a * p.x + plane.b * p.y + plane.d) / plane.c;
+            } else {
+                p.z = meanZ;
+            }
+
+            // Basic z sanity
+            if(p.z < 0.05f || p.z > 20.0f) {
+                continue;
+            }
+
+            p.r = static_cast<uint8_t>(meanR);
+            p.g = static_cast<uint8_t>(meanG);
+            p.b = static_cast<uint8_t>(meanB);
+
+            pts[idx] = p;
+            ++patched;
+        }
+    }
+
+    if(patched > 0) {
+        std::cout << "[PlaneFill] Patched " << patched
+                  << " stride-grid points on dominant plane" << std::endl;
     }
 }
 
@@ -943,7 +1184,7 @@ bool  g_leftDown = false;
 bool  g_drawPoints = true;   // Start with points visible for debugging
 MeshDisplayMode g_meshMode = MESH_FILL;  // Start with filled mesh
 bool  g_autoRotate = false;
-bool  g_paused = false;
+std::atomic<bool> g_paused{false};
 
 float g_sceneScale = 1.0f;
 
@@ -963,24 +1204,36 @@ float g_dzMax     = 0.08f;  // allowed depth jump between adjacent vertices (met
 
 // Mesh hole patching threshold (perimeter in meters)
 float g_holePerimeter = 0.6f;
+bool  g_planeFillEnabled = false;
+
+// Image panel controls/textures
+bool   g_showImagePanel = true;
+GLuint g_texRgb   = 0;
+GLuint g_texDepth = 0;
+int    g_imageW   = 0;
+int    g_imageH   = 0;
+
+constexpr float kPanelPadding = 10.0f;
 
 // Performance tracking
 int g_frameCount = 0;
 int g_lastTime = 0;
 float g_fps = 0.0f;
+float g_lastFrameMs = 0.0f;
+std::string g_lastStatus = "Ready";
 
 void cleanupGLBuffers() {
     if(g_vboPos) { glDeleteBuffers(1, &g_vboPos); g_vboPos = 0; }
     if(g_vboCol) { glDeleteBuffers(1, &g_vboCol); g_vboCol = 0; }
     if(g_eboMesh) { glDeleteBuffers(1, &g_eboMesh); g_eboMesh = 0; }
+    if(g_texRgb) { glDeleteTextures(1, &g_texRgb); g_texRgb = 0; }
+    if(g_texDepth) { glDeleteTextures(1, &g_texDepth); g_texDepth = 0; }
     g_pointCount = 0;
     g_meshIndexCount = 0;
 }
 
 void updateGLBuffers() {
     if(!g_app) return;
-
-    cleanupGLBuffers();
 
     // Get consistent snapshot (cloud and mesh from the same frame)
     pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud;
@@ -996,10 +1249,15 @@ void updateGLBuffers() {
         firstUpdate = false;
     }
 
-    // Vertex position VBO
-    glGenBuffers(1, &g_vboPos);
+    // Vertex position VBO (reuse buffer, reallocate only if needed)
+    if(!g_vboPos) glGenBuffers(1, &g_vboPos);
     glBindBuffer(GL_ARRAY_BUFFER, g_vboPos);
-    glBufferData(GL_ARRAY_BUFFER, g_pointCount * 3 * sizeof(float), nullptr, GL_DYNAMIC_DRAW);
+    static GLsizeiptr vboPosCapacity = 0;
+    GLsizeiptr neededPos = static_cast<GLsizeiptr>(g_pointCount) * 3 * sizeof(float);
+    if(neededPos > vboPosCapacity) {
+        glBufferData(GL_ARRAY_BUFFER, neededPos, nullptr, GL_DYNAMIC_DRAW);
+        vboPosCapacity = neededPos;
+    }
     {
         float* pos = static_cast<float*>(glMapBuffer(GL_ARRAY_BUFFER, GL_WRITE_ONLY));
         if(pos) {
@@ -1021,10 +1279,15 @@ void updateGLBuffers() {
     }
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 
-    // Color VBO
-    glGenBuffers(1, &g_vboCol);
+    // Color VBO (reuse)
+    if(!g_vboCol) glGenBuffers(1, &g_vboCol);
     glBindBuffer(GL_ARRAY_BUFFER, g_vboCol);
-    glBufferData(GL_ARRAY_BUFFER, g_pointCount * 3 * sizeof(GLubyte), nullptr, GL_DYNAMIC_DRAW);
+    static GLsizeiptr vboColCapacity = 0;
+    GLsizeiptr neededCol = static_cast<GLsizeiptr>(g_pointCount) * 3 * sizeof(GLubyte);
+    if(neededCol > vboColCapacity) {
+        glBufferData(GL_ARRAY_BUFFER, neededCol, nullptr, GL_DYNAMIC_DRAW);
+        vboColCapacity = neededCol;
+    }
     {
         GLubyte* col = static_cast<GLubyte*>(glMapBuffer(GL_ARRAY_BUFFER, GL_WRITE_ONLY));
         if(col) {
@@ -1039,46 +1302,11 @@ void updateGLBuffers() {
     }
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 
-    // Mesh indices EBO with invalid-triangle filtering + safety check
+    // Mesh indices EBO with lightweight validation
     std::vector<GLuint> indices;
     indices.reserve(mesh.polygons.size() * 3);
     const auto &pts = cloud->points;
-    
-    // Estimate maxDistance for safety check (consistent with reconstruction)
-    float estimatedSpacing = 0.01f;  // Default spacing estimate
-    if(cloud->width > 1 && cloud->height > 1) {
-        // Quick estimate: sample a few neighbor distances
-        int sampleCount = 0;
-        float sumDist = 0.0f;
-        for(int r = 0; r < std::min(100, static_cast<int>(cloud->height) - 1) && sampleCount < 1000; r += 10) {
-            for(int c = 0; c < std::min(100, static_cast<int>(cloud->width) - 1) && sampleCount < 1000; c += 10) {
-                int idx = r * cloud->width + c;
-                int idxR = idx + 1;
-                if(idxR < static_cast<int>(pts.size()) && pcl::isFinite(pts[idx]) && pcl::isFinite(pts[idxR])) {
-                    float dx = pts[idx].x - pts[idxR].x;
-                    float dy = pts[idx].y - pts[idxR].y;
-                    float dz = pts[idx].z - pts[idxR].z;
-                    float d = std::sqrt(dx*dx + dy*dy + dz*dz);
-                    if(d > 0.0f && d < 0.2f) {
-                        sumDist += d;
-                        sampleCount++;
-                    }
-                }
-            }
-        }
-        if(sampleCount > 0) {
-            estimatedSpacing = sumDist / sampleCount;
-        }
-    }
-    float maxDist_render = estimatedSpacing * g_edgeFactor;
-    const float maxDist2_render = maxDist_render * maxDist_render;
-    
-    auto len2 = [&](GLuint a, GLuint b)->float {
-        const auto &pa = pts[a], &pb = pts[b];
-        float dx=pa.x-pb.x, dy=pa.y-pb.y, dz=pa.z-pb.z;
-        return dx*dx+dy*dy+dz*dz;
-    };
-    
+
     for(const auto& poly : mesh.polygons) {
         if(poly.vertices.size() != 3) continue;
         GLuint i0 = poly.vertices[0];
@@ -1086,14 +1314,7 @@ void updateGLBuffers() {
         GLuint i2 = poly.vertices[2];
         if(i0 >= pts.size() || i1 >= pts.size() || i2 >= pts.size()) continue;
         if(!pcl::isFinite(pts[i0]) || !pcl::isFinite(pts[i1]) || !pcl::isFinite(pts[i2])) continue;
-        
-        // Safety check: filter triangles with edges that are too long or have excessive z-jump
-        float l01 = len2(i0, i1), l12 = len2(i1, i2), l20 = len2(i2, i0);
-        if(l01 > maxDist2_render || l12 > maxDist2_render || l20 > maxDist2_render) continue;
-        if(std::fabs(pts[i0].z - pts[i1].z) > g_dzMax ||
-           std::fabs(pts[i1].z - pts[i2].z) > g_dzMax ||
-           std::fabs(pts[i2].z - pts[i0].z) > g_dzMax) continue;
-        
+
         indices.push_back(i0);
         indices.push_back(i1);
         indices.push_back(i2);
@@ -1102,17 +1323,166 @@ void updateGLBuffers() {
     
     static bool firstMeshUpdate = true;
     if(firstMeshUpdate && g_meshIndexCount > 0) {
-        std::cout << "[OpenGL] ✓ Mesh buffers created! Triangles: " << (g_meshIndexCount/3) << std::endl;
+        std::cout << "[OpenGL] Mesh buffers created. Triangles: " << (g_meshIndexCount/3) << std::endl;
         firstMeshUpdate = false;
     }
     
     if(g_meshIndexCount > 0) {
-        glGenBuffers(1, &g_eboMesh);
+        if(!g_eboMesh) glGenBuffers(1, &g_eboMesh);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_eboMesh);
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.size() * sizeof(GLuint),
-                     indices.data(), GL_DYNAMIC_DRAW);
+        static GLsizeiptr eboCapacity = 0;
+        GLsizeiptr neededEbo = static_cast<GLsizeiptr>(indices.size()) * sizeof(GLuint);
+        if(neededEbo > eboCapacity) {
+            glBufferData(GL_ELEMENT_ARRAY_BUFFER, neededEbo, nullptr, GL_DYNAMIC_DRAW);
+            eboCapacity = neededEbo;
+        }
+        glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, neededEbo, indices.data());
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
     }
+}
+
+void ensureTexture2D(GLuint &tex) {
+    if(!tex) {
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    } else {
+        glBindTexture(GL_TEXTURE_2D, tex);
+    }
+}
+
+void updateImageTextures() {
+    if(!g_app) return;
+
+    std::vector<uint8_t> rgb;
+    std::vector<uint8_t> depth;
+    int w = 0, h = 0;
+    bool hasColor = false;
+    if(!g_app->getLatestImages(rgb, depth, w, h, hasColor)) {
+        return;
+    }
+    (void)hasColor;
+
+    g_imageW = w;
+    g_imageH = h;
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+
+    if(!rgb.empty()) {
+        ensureTexture2D(g_texRgb);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE, rgb.data());
+    }
+    if(!depth.empty()) {
+        ensureTexture2D(g_texDepth);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE, depth.data());
+    }
+    glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+void drawImagePanel(GLuint tex, float x, float y, float w, float h) {
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glBegin(GL_QUADS);
+    glTexCoord2f(0.0f, 1.0f); glVertex2f(x,         y - h);
+    glTexCoord2f(1.0f, 1.0f); glVertex2f(x + w,     y - h);
+    glTexCoord2f(1.0f, 0.0f); glVertex2f(x + w,     y);
+    glTexCoord2f(0.0f, 0.0f); glVertex2f(x,         y);
+    glEnd();
+}
+
+void drawBitmapLine(float x, float y, const char* text) {
+    glRasterPos2f(x, y);
+    while(*text) {
+        glutBitmapCharacter(GLUT_BITMAP_8_BY_13, *text);
+        ++text;
+    }
+}
+
+void setStatus(const std::string& msg) {
+    g_lastStatus = msg;
+}
+
+void drawImagePanels() {
+    if(!g_showImagePanel) return;
+    if((g_texRgb == 0 && g_texDepth == 0) || g_imageW == 0 || g_imageH == 0) return;
+
+    glMatrixMode(GL_PROJECTION);
+    glPushMatrix();
+    glLoadIdentity();
+    glOrtho(0, g_winW, 0, g_winH, -1, 1);
+
+    glMatrixMode(GL_MODELVIEW);
+    glPushMatrix();
+    glLoadIdentity();
+
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glDisable(GL_CULL_FACE);
+    glEnable(GL_TEXTURE_2D);
+    glColor3f(1.0f, 1.0f, 1.0f);
+
+    const float panelWidth = std::max(120.0f, g_winW * 0.28f);
+    const float aspect = static_cast<float>(g_imageH) / static_cast<float>(g_imageW);
+    const float panelHeight = panelWidth * aspect;
+
+    float x = g_winW - panelWidth - kPanelPadding;
+    float y = g_winH - kPanelPadding;
+
+    if(g_texRgb) {
+        drawImagePanel(g_texRgb, x, y, panelWidth, panelHeight);
+        y -= (panelHeight + kPanelPadding);
+    }
+    if(g_texDepth) {
+        drawImagePanel(g_texDepth, x, y, panelWidth, panelHeight);
+        y -= (panelHeight + kPanelPadding);
+    }
+
+    // Key hint block under panels (English)
+    glDisable(GL_TEXTURE_2D);
+    glColor3f(1.0f, 1.0f, 1.0f);
+    const char* lines[] = {
+        "Controls:",
+        "W/S: Move forward/backward",
+        "A/D: Strafe left/right",
+        "Q/E: Roll left/right",
+        "Arrows: Move up/down",
+        "P: Toggle points",
+        "M: Cycle mesh mode",
+        "V: Toggle RGB/Depth panels",
+        "F: Toggle plane fill",
+        "T: Auto rotate, R: Reset view",
+        "H: Toggle hole patch",
+        "Space: Pause/Resume",
+        "C: Capture ply",
+        "ESC: Exit"
+    };
+    float textX = x;
+    float textY = y;
+    const float lineH = 14.0f;
+    for(const char* line : lines) {
+        drawBitmapLine(textX, textY, line);
+        textY -= lineH;
+    }
+
+    // Metrics and last status
+    std::ostringstream ossFps;
+    ossFps << "FPS: " << std::fixed << std::setprecision(1) << g_fps;
+    std::ostringstream ossLat;
+    ossLat << "Frame time: " << static_cast<int>(g_lastFrameMs) << " ms";
+    std::string statusLine = "Status: " + g_lastStatus;
+
+    drawBitmapLine(textX, textY, ossFps.str().c_str()); textY -= lineH;
+    drawBitmapLine(textX, textY, ossLat.str().c_str()); textY -= lineH;
+    drawBitmapLine(textX, textY, statusLine.c_str());   textY -= lineH;
+
+    glDepthMask(GL_TRUE);
+    glEnable(GL_DEPTH_TEST);
+
+    glPopMatrix();
+    glMatrixMode(GL_PROJECTION);
+    glPopMatrix();
+    glMatrixMode(GL_MODELVIEW);
 }
 
 void idleFunc() {
@@ -1129,32 +1499,26 @@ void idleFunc() {
 
     int frameStart = glutGet(GLUT_ELAPSED_TIME);
 
-    int meshTime = 0;
-    int bufferTime = 0;
     int totalTime = 0;
 
-    if(!g_paused && g_app && g_app->hasNewDataAvailable()) {
+    if(!g_paused && g_app && g_app->hasNewMeshAvailable()) {
         int t0 = glutGet(GLUT_ELAPSED_TIME);
-        g_app->reconstructMesh();
-        int t1 = glutGet(GLUT_ELAPSED_TIME);
         updateGLBuffers();
-        int t2 = glutGet(GLUT_ELAPSED_TIME);
+        if(g_showImagePanel) {
+            updateImageTextures();
+        }
+        int t1 = glutGet(GLUT_ELAPSED_TIME);
 
-        meshTime = t1 - t0;
-        bufferTime = t2 - t1;
-        totalTime = t2 - frameStart;
+        totalTime = t1 - frameStart;
+        g_lastFrameMs = static_cast<float>(totalTime);
 
         updateCount++;
         frameIndex++;
         if(updateCount == 1) {
             std::cout << "[OpenGL] First data received and buffers updated!" << std::endl;
         }
-        // Print per-frame processing time
         std::cout << "[Perf] frame " << frameIndex
-                  << " | mesh: " << meshTime << " ms"
-                  << " | buffer: " << bufferTime << " ms"
-                  << " | total: " << totalTime << " ms"
-                  << std::endl;
+                  << " | total: " << totalTime << " ms" << std::endl;
     }
 
     lastTime = currentTime;
@@ -1253,13 +1617,16 @@ void getCameraBasis(
 void displayFunc() {
     static int frameNum = 0;
     frameNum++;
+
+    // Full-window viewport; side panels are drawn as overlays without shrinking the view
+    glViewport(0, 0, g_winW, g_winH);
     
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
     double aspect = (g_winW > 0 && g_winH > 0) ? static_cast<double>(g_winW)/g_winH : 16.0/9.0;
-    gluPerspective(45.0, aspect, 0.01, 100.0);  // 45° FOV for better view
+    gluPerspective(45.0, aspect, 0.01, 100.0);  // 45 deg FOV
 
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
@@ -1303,7 +1670,7 @@ void displayFunc() {
                 glDrawElements(GL_TRIANGLES, g_meshIndexCount, GL_UNSIGNED_INT, reinterpret_cast<void*>(0));
             }
             else if(g_meshMode == MESH_WIREFRAME) {
-                // Wireframe mesh (网格)
+                // Wireframe mesh
                 glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
                 glLineWidth(1.0f);
                 glDrawElements(GL_TRIANGLES, g_meshIndexCount, GL_UNSIGNED_INT, reinterpret_cast<void*>(0));
@@ -1338,6 +1705,15 @@ void displayFunc() {
         glVertex3f(0.0f, 0.0f, 0.0f);
         glVertex3f(0.0f, 0.0f, 0.5f);
         glEnd();
+    }
+
+    // Make sure overlay quads are filled even if mesh mode set polygon mode to lines
+    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+
+    // Overlay RGB/Depth panels on the right
+    bool panelsVisible = g_showImagePanel && g_imageW > 0 && g_imageH > 0 && (g_texRgb || g_texDepth);
+    if(panelsVisible) {
+        drawImagePanels();
     }
 
     // FPS display
@@ -1453,59 +1829,78 @@ void keyboardFunc(unsigned char key, int, int) {
         case 'P':
             g_drawPoints = !g_drawPoints;
             std::cout << "Points: " << (g_drawPoints ? "ON" : "OFF") << std::endl;
+            setStatus(std::string("Points: ") + (g_drawPoints ? "ON" : "OFF"));
+            break;
+        case 'v':
+        case 'V':
+            g_showImagePanel = !g_showImagePanel;
+            std::cout << "RGB/Depth panels: " << (g_showImagePanel ? "ON" : "OFF") << std::endl;
+            setStatus(std::string("Panels: ") + (g_showImagePanel ? "ON" : "OFF"));
             break;
         case 'm':
         case 'M':
             g_meshMode = static_cast<MeshDisplayMode>((g_meshMode + 1) % 3);
             if(g_meshMode == MESH_OFF) {
                 std::cout << "Mesh: OFF" << std::endl;
+                setStatus("Mesh: OFF");
             }
             else if(g_meshMode == MESH_FILL) {
                 std::cout << "Mesh: FILL (triangles: " << g_meshIndexCount/3 << ")" << std::endl;
+                setStatus("Mesh: FILL");
             }
             else if(g_meshMode == MESH_WIREFRAME) {
                 std::cout << "Mesh: WIREFRAME (triangles: " << g_meshIndexCount/3 << ")" << std::endl;
+                setStatus("Mesh: WIREFRAME");
             }
             break;
         case ']':
             g_edgeFactor += 0.5f;
             std::cout << "edge x" << g_edgeFactor << std::endl;
+            setStatus("Edge factor x" + std::to_string(g_edgeFactor));
             break;
         case '[':
             g_edgeFactor = std::max(0.5f, g_edgeFactor - 0.5f);
             std::cout << "edge x" << g_edgeFactor << std::endl;
+            setStatus("Edge factor x" + std::to_string(g_edgeFactor));
             break;
         case '-':
             g_pixStride = std::max(1, g_pixStride - 1);
             std::cout << "pixStride=" << g_pixStride << std::endl;
+            setStatus("Pix stride=" + std::to_string(g_pixStride));
             break;
         case '=':
             g_pixStride = std::min(16, g_pixStride + 1);
             std::cout << "pixStride=" << g_pixStride << std::endl;
+            setStatus("Pix stride=" + std::to_string(g_pixStride));
             break;
         case '.':
         case '>':
             g_holePerimeter = std::min(5.0f, g_holePerimeter + 0.1f);
             std::cout << "holePerimeter=" << g_holePerimeter << " m" << std::endl;
+            setStatus("Hole perimeter=" + std::to_string(g_holePerimeter));
             break;
         case ',':
         case '<':
             g_holePerimeter = std::max(0.1f, g_holePerimeter - 0.1f);
             std::cout << "holePerimeter=" << g_holePerimeter << " m" << std::endl;
+            setStatus("Hole perimeter=" + std::to_string(g_holePerimeter));
             break;
         case 'r':
         case 'R':
             resetCameraPose();
             std::cout << "[Camera] Reset to default view" << std::endl;
+            setStatus("Camera reset");
             break;
         case 't':
         case 'T':
             g_autoRotate = !g_autoRotate;
             std::cout << "Auto-rotate: " << (g_autoRotate ? "ON" : "OFF") << std::endl;
+            setStatus(std::string("Auto-rotate: ") + (g_autoRotate ? "ON" : "OFF"));
             break;
         case ' ':
             g_paused = !g_paused;
             std::cout << "Paused: " << (g_paused ? "YES" : "NO") << std::endl;
+            setStatus(std::string("Paused: ") + (g_paused ? "YES" : "NO"));
             break;
         case 'c':
         case 'C':
@@ -1513,7 +1908,22 @@ void keyboardFunc(unsigned char key, int, int) {
                 g_app->savePointCloud("captured_cloud.ply");
                 g_app->saveMesh("captured_mesh.ply");
                 std::cout << "Saved current frame!" << std::endl;
+                setStatus("Captured current frame");
             }
+            break;
+        case 'h':
+        case 'H':
+            g_holePatchEnabled = !g_holePatchEnabled;
+            std::cout << "Hole patching (small + plane): "
+                      << (g_holePatchEnabled ? "ON" : "OFF") << std::endl;
+            setStatus(std::string("Hole patching: ") + (g_holePatchEnabled ? "ON" : "OFF"));
+            break;
+        case 'f':
+        case 'F':
+            g_planeFillEnabled = !g_planeFillEnabled;
+            std::cout << "Plane-based hole fill: "
+                      << (g_planeFillEnabled ? "ON" : "OFF") << std::endl;
+            setStatus(std::string("Plane fill: ") + (g_planeFillEnabled ? "ON" : "OFF"));
             break;
         default:
             break;
@@ -1544,10 +1954,13 @@ void printControls() {
     std::cout << "  Q / E           : Roll left / right\n";
     std::cout << "  Arrow Up/Down   : Move up / down\n";
     std::cout << "  P               : Toggle points display\n";
+    std::cout << "  V               : Toggle RGB/Depth side panels\n";
+    std::cout << "  F               : Toggle plane-based hole fill\n";
     std::cout << "  M               : Cycle mesh mode (FILL/WIREFRAME/OFF)\n";
     std::cout << "  [ / ]           : Adjust mesh edge factor\n";
     std::cout << "  - / =           : Adjust mesh pixel stride\n";
     std::cout << "  , / .           : Adjust hole patch perimeter\n";
+    std::cout << "  H               : Toggle hole patching (small + plane)\n";
     std::cout << "  R               : Reset camera to default view\n";
     std::cout << "  T               : Toggle auto-rotate\n";
     std::cout << "  SPACE           : Pause/Resume\n";

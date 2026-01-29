@@ -1,5 +1,7 @@
 # P2M – Realtime Mesh Viewer (Orbbec + PCL + OpenGL)
 
+## Important: You may refer to the `Poster.pdf` to get a better understanding.
+
 ## Overview
 P2M is a standalone realtime RGB‑D mesh reconstruction viewer built with Orbbec SDK, PCL, and OpenGL. It captures frames from an Orbbec depth camera, reconstructs a mesh on the fly, and renders points/mesh via VBO/EBO. Image panels on the right can show the latest RGB and depth previews along with live controls/status text.
 
